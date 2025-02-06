@@ -69,27 +69,31 @@ pub fn Channel(comptime T: type) type {
         pub fn Select(comptime N: usize) type {
             return struct {
                 const SelSelf = @This();
+                const SelectResult = struct {
+                    channel: *Self,
+                    index: usize,
+                };
                 lock: std.Thread.Mutex,
                 sem: std.Thread.Semaphore,
                 chans: [N]?*Self,
                 n: usize,
 
-                pub fn select(selself: *SelSelf) !*Self {
+                pub fn select(selself: *SelSelf) !SelectResult {
                     if (selself.n == 0) return error.SelectEmpty;
                     selself.lock.lock();
                     defer selself.lock.unlock();
                     while (true) {
-                        for (selself.chans) |mchan| {
+                        for (selself.chans, 0..) |mchan, idx| {
                             if (mchan) |chan| {
                                 if (chan.closed) return error.ChannelClosed;
-                                if (chan.canRecv()) return chan;
+                                if (chan.canRecv()) return .{ .channel = chan, .index = idx };
                             }
                         }
                         selself.sem.wait();
                     }
                 }
 
-                pub fn add(selself: *SelSelf, chan: *Self) !void {
+                pub fn add(selself: *SelSelf, chan: *Self) !usize {
                     selself.lock.lock();
                     defer selself.lock.unlock();
                     for (0..selself.chans.len) |i| {
@@ -97,7 +101,7 @@ pub fn Channel(comptime T: type) type {
                         selself.chans[i] = chan;
                         chan.mselectsem = &selself.sem;
                         selself.n += 1;
-                        return;
+                        return i;
                     }
                     return error.SelectFull;
                 }
@@ -178,11 +182,11 @@ test "select test" {
 
     std.debug.print("main sender thread start\n", .{});
 
-    try select.add(&chan);
+    _ = try select.add(&chan);
     const t1 = try std.Thread.spawn(.{}, testproc2, .{&chan});
 
-    var c = try select.select();
-    const res = try c.recv();
+    var sr = try select.select();
+    const res = try sr.channel.recv();
     std.debug.print("main select thread got {}\n", .{res});
     t1.join();
 }
