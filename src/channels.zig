@@ -1,5 +1,11 @@
 const std = @import("std");
 
+pub const ChannelError = error{
+    ChannelClosed,
+    SelectEmpty,
+    SelectFull,
+};
+
 pub fn Channel(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -13,29 +19,32 @@ pub fn Channel(comptime T: type) type {
         recvsem: std.Thread.Semaphore,
         mselectsem: ?*std.Thread.Semaphore,
 
-        pub fn send(self: *Self, data: T) !void {
-            if (self.closed) return error.ChannelClosed;
+        pub fn send(self: *Self, data: T) ChannelError!void {
+            if (self.closed) return ChannelError.ChannelClosed;
             self.sendlock.lock();
             defer self.sendlock.unlock();
+            if (self.closed) return ChannelError.ChannelClosed;
             self.buffer = data;
             self.full = true;
             self.recvsem.post();
             if (self.mselectsem) |selectsem|
                 selectsem.post();
-            if (self.closed) return error.ChannelClosed;
+            if (self.closed) return ChannelError.ChannelClosed;
             self.sendsem.wait();
+            if (self.closed) return ChannelError.ChannelClosed;
         }
 
-        pub fn recv(self: *Self) !T {
-            if (self.closed) return error.ChannelClosed;
+        pub fn recv(self: *Self) ChannelError!T {
+            if (self.closed) return ChannelError.ChannelClosed;
             self.recvlock.lock();
             defer self.recvlock.unlock();
+            if (self.closed) return ChannelError.ChannelClosed;
             self.recvsem.wait();
-            if (self.closed) return error.ChannelClosed;
             const data = self.buffer;
             self.buffer = undefined;
             self.full = false;
             self.sendsem.post();
+            if (self.closed) return ChannelError.ChannelClosed;
             return data;
         }
 
@@ -78,14 +87,14 @@ pub fn Channel(comptime T: type) type {
                 chans: [N]?*Self,
                 n: usize,
 
-                pub fn select(selself: *SelSelf) !SelectResult {
-                    if (selself.n == 0) return error.SelectEmpty;
+                pub fn select(selself: *SelSelf) ChannelError!SelectResult {
+                    if (selself.n == 0) return ChannelError.SelectEmpty;
                     selself.lock.lock();
                     defer selself.lock.unlock();
                     while (true) {
                         for (selself.chans, 0..) |mchan, idx| {
                             if (mchan) |chan| {
-                                if (chan.closed) return error.ChannelClosed;
+                                if (chan.closed) return ChannelError.ChannelClosed;
                                 if (chan.canRecv()) return .{ .channel = chan, .index = idx };
                             }
                         }
@@ -93,7 +102,12 @@ pub fn Channel(comptime T: type) type {
                     }
                 }
 
-                pub fn add(selself: *SelSelf, chan: *Self) !usize {
+                pub fn selectRecv(selself: *SelSelf) ChannelError!T {
+                    const sr = try selself.select();
+                    return sr.channel.recv();
+                }
+
+                pub fn add(selself: *SelSelf, chan: *Self) ChannelError!usize {
                     selself.lock.lock();
                     defer selself.lock.unlock();
                     for (0..selself.chans.len) |i| {
@@ -103,7 +117,7 @@ pub fn Channel(comptime T: type) type {
                         selself.n += 1;
                         return i;
                     }
-                    return error.SelectFull;
+                    return ChannelError.SelectFull;
                 }
 
                 pub fn removeClosed(selself: *SelSelf) void {
@@ -144,12 +158,6 @@ fn testproc2(c: *TestChan) void {
     std.debug.print("thread sent 5\n", .{});
 }
 
-fn testproc3(c: *TestChan) void {
-    std.debug.print("recv thread start\n", .{});
-    const res = c.recv() catch unreachable;
-    std.debug.print("thread got {}\n", .{res});
-}
-
 test "basic channel test" {
     var chan = TestChan.init();
     var c = &chan;
@@ -159,6 +167,12 @@ test "basic channel test" {
     const res = try c.recv();
     std.debug.print("main chan thread got {}\n", .{res});
     t1.join();
+}
+
+fn testproc3(c: *TestChan) void {
+    std.debug.print("recv thread start\n", .{});
+    const res = c.recv() catch unreachable;
+    std.debug.print("thread got {}\n", .{res});
 }
 
 test "complex channel test" {
@@ -189,4 +203,57 @@ test "select test" {
     const res = try sr.channel.recv();
     std.debug.print("main select thread got {}\n", .{res});
     t1.join();
+}
+
+fn testproc4(threadn: usize, mainchan: *TestChan, mychan: *TestChan) void {
+    std.debug.print("starting thread {}\n", .{threadn});
+
+    while (mainchan.recv()) |res| {
+        std.debug.print("thread {}: got {}\n", .{ threadn, res });
+        mychan.send(res) catch {
+            std.debug.print("thread {}: my channel closed\n", .{threadn});
+            return;
+        };
+    } else |_| {
+        std.debug.print("thread {}: main channel closed\n", .{threadn});
+        return;
+    }
+}
+
+fn selectTest(comptime nthreads: usize) !void {
+    var mainchan = TestChan.init();
+    var select = TestChan.Select(nthreads).init();
+    var childchans: [nthreads]TestChan = undefined;
+    var threads: [nthreads]std.Thread = undefined;
+
+    std.debug.print("main thread start\n", .{});
+
+    for (childchans, 0..) |_, i| {
+        childchans[i] = TestChan.init();
+        threads[i] = try std.Thread.spawn(.{}, testproc4, .{ i, &mainchan, &childchans[i] });
+        _ = try select.add(&childchans[i]);
+    }
+
+    for (0..100) |i| {
+        std.debug.print("main: sending {}\n", .{i});
+        try mainchan.send(@intCast(i));
+        var sr = try select.select();
+        const res = try sr.channel.recv();
+        std.debug.print("main: got {} from channel {}\n", .{ res, sr.index });
+    }
+    for (childchans, 0..) |_, i| childchans[i].close();
+    mainchan.close();
+    for (threads, 0..) |_, i| threads[i].join();
+}
+
+test "multi-thread select test 1" {
+    try selectTest(2);
+}
+
+test "multi-thread select test 2" {
+    try selectTest(4);
+}
+
+test "multi-thread select test 3" {
+    try selectTest(7);
 }

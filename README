@@ -1,0 +1,3 @@
+zig-channels -- a basic implementation of unbuffered channels.
+Not really complete. See the tests in src/channels.zig for usage.
+
