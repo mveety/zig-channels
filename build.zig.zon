@@ -1,6 +1,7 @@
 .{
-    .name = "zig-channels",
+    .name = .zig_channels,
     .version = "0.0.1",
+    .fingerprint = 0x96d7ab36688b6814,
     .dependencies = .{},
     .paths = .{
         "build.zig",
